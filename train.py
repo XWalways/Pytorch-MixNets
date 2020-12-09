@@ -19,6 +19,7 @@ import models
 from models import MixNet
 from flops_counter import get_model_complexity_info
 from PIL import ImageFile
+import tensorboardX
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 from utils import Bar, Logger, AverageMeter, accuracy, mkdir_p
@@ -65,6 +66,8 @@ parser.add_argument('-c', '--checkpoint', default='checkpoint', type=str, metava
                     help='path to save checkpoint (default: checkpoint)')
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
+parser.add_argument('--logdir', default='./logs/mixnet', type=str,
+                    help='path to save log.')
 # Architecture
 parser.add_argument('--modelsize', '-ms', metavar='l', default='l', \
                     choices=['l', 'm', 's'], \
@@ -135,7 +138,7 @@ def main():
     # create model
    
     
-    print("=> creating model '{}'".format(args.arch))
+    print("=> creating model MixNet.")
     model = MixNet(args.modelsize)
 
     flops, params = get_model_complexity_info(model, (224, 224), as_strings=False, print_per_layer_stat=False)
@@ -179,7 +182,7 @@ def main():
             T_max=args.epochs,
             last_epoch=(args.epochs - 1))
     # Resume
-    title = 'ImageNet-' + args.arch
+    title = 'ImageNet-MixNet'
     if args.resume:
         # Load checkpoint.
         print('==> Resuming from checkpoint..', args.resume)
@@ -214,7 +217,8 @@ def main():
         test_loss, test_acc = test(val_loader, model, criterion, start_epoch, use_cuda)
         print(' Test Loss:  %.8f, Test Acc:  %.2f' % (test_loss, test_acc))
         return
-
+    # TensorBoardX Logs
+    train_writer = tensorboardX.SummaryWriter(args.logdir)
     # Train and val
     for epoch in range(start_epoch, args.epochs):
         lr_scheduler.step()
@@ -223,6 +227,12 @@ def main():
 
         train_loss, train_acc = train(train_loader, model, criterion, optimizer, epoch, use_cuda)
         test_loss, test_acc = test(val_loader, model, criterion, epoch, use_cuda)
+        
+        # add scalars
+        train_writer.add_scalar('train_loss', train_loss, epoch)
+        train_writer.add_scalar('train_acc', train_acc, epoch)
+        train_writer.add_scalar('test_loss', test_loss, epoch)
+        train_writer.add_scalar('test_acc', test_acc, epoch)
 
         # append logger file
         logger.append([state['lr'], train_loss, test_loss, train_acc, test_acc])
@@ -271,7 +281,7 @@ def train(train_loader, model, criterion, optimizer, epoch, use_cuda):
         # compute output
         outputs = model(inputs)
         loss = criterion(outputs, targets)
-
+        
         # measure accuracy and record loss
         prec1, prec5 = accuracy(outputs.data, targets.data, topk=(1, 5))
         losses.update(loss.data, inputs.size(0))
