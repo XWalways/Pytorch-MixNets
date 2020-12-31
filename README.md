@@ -8,9 +8,9 @@ Change the `--data` path in `train.sh`,run `sh train.sh`
 
 
 or you can
+
 `
 form mixnet import MixNet
-
 
 net = MixNet(net_type='mixnet_s')
 `
