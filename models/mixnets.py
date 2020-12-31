@@ -20,23 +20,26 @@ class Swish(nn.Module):
 
 #SE Block
 class SELayer(nn.Module):
-    def __init__(self, channel, reduction=16, fc=True, act_type="swish"):
+    def __init__(self, channel, reduction=16, fc=False, act_type="swish"):
         super(SELayer, self).__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        if fc:
-            self.fc = nn.Sequential(nn.Linear(channel, channel // reduction),
+        self.fc = fc
+        if self.fc:
+            self.fc = nn.Sequential(nn.Linear(channel, channel // reduction, bias=False),
                                     Swish(inplace=True) if act_type == "swish" else nn.ReLU(inplace = True),
-                                    nn.Linear(channel // reduction, channel),
+                                    nn.Linear(channel // reduction, channel, bias=False),
                                     nn.Sigmoid())
         else:
-            self.fc = nn.Sequential(nn.Conv2d(channel, channel // reduction, kernel_size=1, stride=1),
-                                    nn.Linear(channel // reduction, channel, kernel_size=1, stride=1),
+            self.fc = nn.Sequential(nn.Conv2d(channel, channel // reduction, kernel_size=1, stride=1, bias=True),
                                     Swish(inplace=True) if act_type == "swish" else nn.ReLU(inplace = True),
+                                    nn.Conv2d(channel // reduction, channel, kernel_size=1, stride=1, bias=True),
                                     nn.Sigmoid())
-    def forward(self, x):
-        b, c, _, _ = x.size()
-        y = self.avg_pool(x).view(b, c)
-        y = self.fc(y).view(b, c, 1, 1)
+    def forward(self, x): 
+        y = self.avg_pool(x) # BxCx1x1
+        if self.fc == False:
+            y = self.fc(y).view(x.size(0), x.size(1), 1, 1)
+        if self.fc == True:
+            y = self.fc(y.view(x.size(0), x.size(1))).view(x.size(0), x.size(1), 1, 1)
         return x * y
 
 
@@ -180,42 +183,42 @@ class MixNet(nn.Module):
                 [1, 16,  1, [3],              [1],    [1],    1, 1, "relu",  None],
                 [6, 24,  1, [3],              [1, 1], [1, 1], 2, 1, "relu",  None],
                 [3, 24,  1, [3],              [1, 1], [1, 1], 1, 1, "relu",  None],
-                [6, 40,  1, [3, 5, 7],        [1],    [1],    2, 1, "swish", 2],
-                [6, 40,  3, [3, 5],           [1, 1], [1, 1], 1, 1, "swish", 2],
-                [6, 80,  1, [3, 5, 7],        [1],    [1, 1], 2, 1, "swish", 4],
-                [6, 80,  2, [3, 5],           [1],    [1, 1], 1, 1, "swish", 4],
-                [6, 120, 1, [3, 5, 7],        [1, 1], [1, 1], 1, 1, "swish", 2],
-                [3, 120, 2, [3, 5, 7, 9],     [1, 1], [1, 1], 1, 1, "swish", 2],
-                [6, 200, 1, [3, 5, 7, 9, 11], [1],    [1],    2, 1, "swish", 2],
-                [6, 200, 2, [3, 5, 7, 9],     [1],    [1, 1], 1, 1, "swish", 2]
+                [6, 40,  1, [3, 5, 7],        [1],    [1],    2, 1, "swish", 12],
+                [6, 40,  3, [3, 5],           [1, 1], [1, 1], 1, 1, "swish", 12],
+                [6, 80,  1, [3, 5, 7],        [1],    [1, 1], 2, 1, "swish", 24],
+                [6, 80,  2, [3, 5],           [1],    [1, 1], 1, 1, "swish", 24],
+                [6, 120, 1, [3, 5, 7],        [1, 1], [1, 1], 1, 1, "swish", 12],
+                [3, 120, 2, [3, 5, 7, 9],     [1, 1], [1, 1], 1, 1, "swish", 12],
+                [6, 200, 1, [3, 5, 7, 9, 11], [1],    [1],    2, 1, "swish", 12],
+                [6, 200, 2, [3, 5, 7, 9],     [1],    [1, 1], 1, 1, "swish", 12]
             ], 1.0, 1.0, 0.2),
             'm': (24, [
                 # t, c,  n, k,            ek,     pk,     s, d,  a,      se
                 [1, 24,  1, [3],          [1],    [1],    1, 1, "relu",  None],
                 [6, 32,  1, [3, 5, 7],    [1, 1], [1, 1], 2, 1, "relu",  None],
                 [3, 32,  1, [3],          [1, 1], [1, 1], 1, 1, "relu",  None],
-                [6, 40,  1, [3, 5, 7, 9], [1],    [1],    2, 1, "swish", 2],
-                [6, 40,  3, [3, 5],       [1, 1], [1, 1], 1, 1, "swish", 2],
-                [6, 80,  1, [3, 5, 7],    [1],    [1],    2, 1, "swish", 4],
-                [6, 80,  3, [3, 5, 7, 9], [1, 1], [1, 1], 1, 1, "swish", 4],
-                [6, 120, 1, [3],          [1],    [1],    1, 1, "swish", 2],
-                [3, 120, 3, [3, 5, 7, 9], [1, 1], [1, 1], 1, 1, "swish", 2],
-                [6, 200, 1, [3, 5, 7, 9], [1],    [1],    2, 1, "swish", 2],
-                [6, 200, 3, [3, 5, 7, 9], [1],    [1, 1], 1, 1, "swish", 2]
+                [6, 40,  1, [3, 5, 7, 9], [1],    [1],    2, 1, "swish", 12],
+                [6, 40,  3, [3, 5],       [1, 1], [1, 1], 1, 1, "swish", 12],
+                [6, 80,  1, [3, 5, 7],    [1],    [1],    2, 1, "swish", 24],
+                [6, 80,  3, [3, 5, 7, 9], [1, 1], [1, 1], 1, 1, "swish", 24],
+                [6, 120, 1, [3],          [1],    [1],    1, 1, "swish", 12],
+                [3, 120, 3, [3, 5, 7, 9], [1, 1], [1, 1], 1, 1, "swish", 12],
+                [6, 200, 1, [3, 5, 7, 9], [1],    [1],    2, 1, "swish", 12],
+                [6, 200, 3, [3, 5, 7, 9], [1],    [1, 1], 1, 1, "swish", 12]
             ],  1.0, 1.0, 0.25),
             'l': (24, [
                 # t, c,  n, k,            ek,     pk,     s, d,  a,      se
                 [1, 24,  1, [3],          [1],    [1],    1, 1, "relu",  None],
                 [6, 32,  1, [3, 5, 7],    [1, 1], [1, 1], 2, 1, "relu",  None],
                 [3, 32,  1, [3],          [1, 1], [1, 1], 1, 1, "relu",  None],
-                [6, 40,  1, [3, 5, 7, 9], [1],    [1],    2, 1, "swish", 2],
-                [6, 40,  3, [3, 5],       [1, 1], [1, 1], 1, 1, "swish", 2],
-                [6, 80,  1, [3, 5, 7],    [1],    [1],    2, 1, "swish", 4],
-                [6, 80,  3, [3, 5, 7, 9], [1, 1], [1, 1], 1, 1, "swish", 4],
-                [6, 120, 1, [3],          [1],    [1],    1, 1, "swish", 2],
-                [3, 120, 3, [3, 5, 7, 9], [1, 1], [1, 1], 1, 1, "swish", 2],
-                [6, 200, 1, [3, 5, 7, 9], [1],    [1],    2, 1, "swish", 2],
-                [6, 200, 3, [3, 5, 7, 9], [1],    [1, 1], 1, 1, "swish", 2]
+                [6, 40,  1, [3, 5, 7, 9], [1],    [1],    2, 1, "swish", 12],
+                [6, 40,  3, [3, 5],       [1, 1], [1, 1], 1, 1, "swish", 12],
+                [6, 80,  1, [3, 5, 7],    [1],    [1],    2, 1, "swish", 24],
+                [6, 80,  3, [3, 5, 7, 9], [1, 1], [1, 1], 1, 1, "swish", 24],
+                [6, 120, 1, [3],          [1],    [1],    1, 1, "swish", 12],
+                [3, 120, 3, [3, 5, 7, 9], [1, 1], [1, 1], 1, 1, "swish", 12],
+                [6, 200, 1, [3, 5, 7, 9], [1],    [1],    2, 1, "swish", 12],
+                [6, 200, 3, [3, 5, 7, 9], [1],    [1, 1], 1, 1, "swish", 12]
             ], 1.3, 1.0, 0.25),
         }
         stem_planes, settings, width_multi, depth_multi, self.dropout_rate = params[arch]
