@@ -229,10 +229,10 @@ def main():
         test_loss, test_acc = test(val_loader, model, criterion, epoch, use_cuda)
         
         # add scalars
-        train_writer.add_scalar('train_loss', train_loss, epoch)
-        train_writer.add_scalar('train_acc', train_acc, epoch)
-        train_writer.add_scalar('test_loss', test_loss, epoch)
-        train_writer.add_scalar('test_acc', test_acc, epoch)
+        train_writer.add_scalars('train_loss', train_loss, epoch)
+        train_writer.add_scalars('train_acc', train_acc, epoch)
+        train_writer.add_scalars('test_loss', test_loss, epoch)
+        train_writer.add_scalars('test_acc', test_acc, epoch)
 
         # append logger file
         logger.append([state['lr'], train_loss, test_loss, train_acc, test_acc])
@@ -249,7 +249,7 @@ def main():
             }, is_best, checkpoint=args.checkpoint)
 
     logger.close()
-
+    train_writer.close()
     print('Best acc:')
     print(best_acc)
 
