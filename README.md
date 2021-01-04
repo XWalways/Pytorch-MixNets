@@ -22,3 +22,6 @@ https://github.com/ansleliu/MixNet-PyTorch
 
 
 https://github.com/osmr/imgclsmob
+
+
+https://github.com/tczhangzhi/pytorch-distributed
