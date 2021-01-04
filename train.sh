@@ -1,1 +1,2 @@
-python train.py -ms s --data /home/data/.mxnet/datasets/imagenet --epochs 100 --lr-decay 0.1 --lr-mode multistep --lr-decay-epoch 30,60,90 -c checkpoints/mixnet --logdir ./logs/mixnet --gpu-id 0,1,2,3,4,5,6,7
+CUDA_VISIBLE_DEVICES=0,1,3,5 python -m torch.distributed.launch --nproc_per_node=4 train.py -ms s --data /home/data/.mxnet/datasets/imagenet --train-batch 4 --test-batch 4 --epochs 100 --lr 0.2 --lr-mode cosine -c checkpoints/mixnet --logdir ./logs/mixnet
+#--lr-decay 0.1 --lr-mode multistep --lr-decay-epoch 30,60,90

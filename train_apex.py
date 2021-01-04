@@ -94,6 +94,60 @@ parser.add_argument('--local_rank', default=-1, type=int,
 args = parser.parse_args()
 
 
+class data_prefetcher():
+    def __init__(self, loader):
+        self.loader = iter(loader)
+        self.stream = torch.cuda.Stream()
+        self.mean = torch.tensor([0.485 * 255, 0.456 * 255, 0.406 * 255]).cuda().view(1, 3, 1, 1)
+        self.std = torch.tensor([0.229 * 255, 0.224 * 255, 0.225 * 255]).cuda().view(1, 3, 1, 1)
+        # With Amp, it isn't necessary to manually convert data to half.
+        # if args.fp16:
+        #     self.mean = self.mean.half()
+        #     self.std = self.std.half()
+        self.preload()
+
+    def preload(self):
+        try:
+            self.next_input, self.next_target = next(self.loader)
+        except StopIteration:
+            self.next_input = None
+            self.next_target = None
+            return
+        # if record_stream() doesn't work, another option is to make sure device inputs are created
+        # on the main stream.
+        # self.next_input_gpu = torch.empty_like(self.next_input, device='cuda')
+        # self.next_target_gpu = torch.empty_like(self.next_target, device='cuda')
+        # Need to make sure the memory allocated for next_* is not still in use by the main stream
+        # at the time we start copying to next_*:
+        # self.stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self.stream):
+            self.next_input = self.next_input.cuda(non_blocking=True)
+            self.next_target = self.next_target.cuda(non_blocking=True)
+            # more code for the alternative if record_stream() doesn't work:
+            # copy_ will record the use of the pinned source tensor in this side stream.
+            # self.next_input_gpu.copy_(self.next_input, non_blocking=True)
+            # self.next_target_gpu.copy_(self.next_target, non_blocking=True)
+            # self.next_input = self.next_input_gpu
+            # self.next_target = self.next_target_gpu
+
+            # With Amp, it isn't necessary to manually convert data to half.
+            # if args.fp16:
+            #     self.next_input = self.next_input.half()
+            # else:
+            self.next_input = self.next_input.float()
+            self.next_input = self.next_input.sub_(self.mean).div_(self.std)
+
+    def next(self):
+        torch.cuda.current_stream().wait_stream(self.stream)
+        input = self.next_input
+        target = self.next_target
+        if input is not None:
+            input.record_stream(torch.cuda.current_stream())
+        if target is not None:
+            target.record_stream(torch.cuda.current_stream())
+        self.preload()
+        return input, target
+
 # Use CUDA
 use_cuda = torch.cuda.is_available()
 nprocs = torch.cuda.device_count()
@@ -118,7 +172,7 @@ num_itertions = 0 #total iterations
 
 def main():
     dist.init_process_group(backend='nccl')
-    torch.cuda.set_device(args.local_rank)
+    
     train_batch = int(args.train_batch / nprocs)
     test_batch = int(args.test_batch / nprocs)
     
@@ -169,19 +223,18 @@ def main():
     
     print("=> creating model MixNet.")
     model = MixNet(args.modelsize)
-    model.cuda(local_rank)
-
     flops, params = get_model_complexity_info(model, (224, 224), as_strings=False, print_per_layer_stat=False)
     print('Flops:  %.3fG' % (flops / 1e9))
     print('Params: %.2fM' % (params / 1e6))
-
-   
-    #model = torch.nn.DataParallel(model).cuda()
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank])
+    torch.cuda.set_device(args.local_rank)
+    model.cuda()
 
     # define loss function (criterion) and optimizer
-    criterion = nn.CrossEntropyLoss().cuda(local_rank)
+    criterion = nn.CrossEntropyLoss().cuda()
     optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay, nesterov=True)
+
+    model, optimizer = amp.initialize(model, optimizer)
+    model = DistributedDataParallel(model)
     cudnn.benchmark = True
 
     lr_mode = args.lr_mode
@@ -255,6 +308,7 @@ def main():
     for epoch in range(start_epoch, args.epochs):
         train_sampler.set_epoch(epoch)
         val_sampler.set_epoch(epoch)
+
         lr_scheduler.step()
 
         print('\nEpoch: [%d | %d]' % (epoch + 1, args.epochs))
@@ -301,17 +355,16 @@ def train(train_loader, model, criterion, optimizer, epoch, use_cuda, local_rank
 
     bar = Bar('Processing', max=len(train_loader))
     show_step = len(train_loader) // 10
-    for batch_idx, (inputs, targets) in enumerate(train_loader):
+    prefetcher = data_prefetcher(train_loader)
+    inputs, targets = prefetcher.next()
+    batch_idx = 0
+    while inputs is not None:
         
         batch_size = inputs.size(0)
         if batch_size < args.train_batch:
             continue
         # measure data loading time
         data_time.update(time.time() - end)
-
-        if use_cuda:
-            inputs, targets = inputs.cuda(local_rank, non_blocking=True), targets.cuda(local_rank, non_blocking=True)
-        inputs, targets = torch.autograd.Variable(inputs), torch.autograd.Variable(targets)
 
         # compute output
         outputs = model(inputs)
@@ -332,7 +385,8 @@ def train(train_loader, model, criterion, optimizer, epoch, use_cuda, local_rank
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
-        loss.backward()
+        with amp.scale_loss(loss, optimizer) as scaled_loss:
+            scaled_loss.backward()
         optimizer.step()
         
 
@@ -355,6 +409,8 @@ def train(train_loader, model, criterion, optimizer, epoch, use_cuda, local_rank
                     top1=top1.avg,
                     top5=top5.avg,
                     )
+        batch_idx += 1
+        inputs, targets = prefetcher.next()
         if (batch_idx) % show_step == 0:
             print(bar.suffix)
         bar.next()
@@ -377,13 +433,12 @@ def test(val_loader, model, criterion, epoch, use_cuda, local_rank):
 
     end = time.time()
     bar = Bar('Processing', max=len(val_loader))
-    for batch_idx, (inputs, targets) in enumerate(val_loader):
+    prefetcher = data_prefetcher(val_loader)
+    inputs, targets = prefetcher.next()
+    batch_idx = 0
+    while inputs is not None:
         # measure data loading time
         data_time.update(time.time() - end)
-
-        if use_cuda:
-            inputs, targets = inputs.cuda(local_rank, non_blocking=True), targets.cuda(local_rank, non_blocking=True)
-        inputs, targets = torch.autograd.Variable(inputs, volatile=True), torch.autograd.Variable(targets)
 
         # compute output
         outputs = model(inputs)
@@ -416,6 +471,8 @@ def test(val_loader, model, criterion, epoch, use_cuda, local_rank):
                     top5=top5.avg,
                     )
         bar.next()
+        batch_idx += 1
+        inputs, targets = prefetcher.next()
     print(bar.suffix)
     bar.finish()
     return (losses.avg, top1.avg)
