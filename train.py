@@ -91,12 +91,6 @@ parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
 parser.add_argument('--local_rank', default=-1, type=int, 
                     help='node rank for distributed training')
 
-args = parser.parse_args()
-
-
-# Use CUDA
-use_cuda = torch.cuda.is_available()
-nprocs = torch.cuda.device_count()
 
 def reduce_mean(tensor, nprocs):
     rt = tensor.clone()
@@ -105,24 +99,29 @@ def reduce_mean(tensor, nprocs):
     return rt
 
 # Random seed
-if args.manualSeed is None:
-    args.manualSeed = random.randint(1, 10000)
-random.seed(args.manualSeed)
-torch.manual_seed(args.manualSeed)
-if use_cuda:
-    torch.cuda.manual_seed_all(args.manualSeed)
-    cudnn.deterministic = True
-
-best_acc = 0  # best test accuracy
-num_itertions = 0 #total iterations
 
 def main():
+    args = parser.parse_args()
+    nprocs = torch.cuda.device_count()
+    if args.manualSeed is None:
+        args.manualSeed = random.randint(1, 10000)
+        random.seed(args.manualSeed)
+    torch.manual_seed(args.manualSeed)
+    torch.cuda.manual_seed_all(args.manualSeed)
+    cudnn.deterministic = True
+    main_worker(args.local_rank, nprocs, args)
+
+
+
+def main_worker(local_rank, nprocs, args):
+    best_acc = 0  # best test accuracy
+
     dist.init_process_group(backend='nccl')
     torch.cuda.set_device(args.local_rank)
+
     train_batch = int(args.train_batch / nprocs)
     test_batch = int(args.test_batch / nprocs)
     
-    global best_acc
     start_epoch = args.start_epoch  # start from epoch 0 or last checkpoint epoch
 
     if not os.path.isdir(args.checkpoint):
@@ -147,7 +146,6 @@ def main():
                                                batch_size=train_batch,
                                                num_workers=args.workers,
                                                pin_memory=True,
-                                               shuffle=True,
                                                sampler=train_sampler)
 
     val_dataset = datasets.ImageFolder(valdir, transforms.Compose([
@@ -169,18 +167,17 @@ def main():
     
     print("=> creating model MixNet.")
     model = MixNet(args.modelsize)
-    model.cuda(local_rank)
+    
 
     flops, params = get_model_complexity_info(model, (224, 224), as_strings=False, print_per_layer_stat=False)
     print('Flops:  %.3fG' % (flops / 1e9))
     print('Params: %.2fM' % (params / 1e6))
 
-   
-    #model = torch.nn.DataParallel(model).cuda()
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank])
+    model.cuda(args.local_rank)
+    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank], find_unused_parameters=True)
 
     # define loss function (criterion) and optimizer
-    criterion = nn.CrossEntropyLoss().cuda(local_rank)
+    criterion = nn.CrossEntropyLoss().cuda(args.local_rank)
     optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay, nesterov=True)
     cudnn.benchmark = True
 
@@ -246,7 +243,7 @@ def main():
 
     if args.evaluate:
         print('\nEvaluation only')
-        test_loss, test_acc = test(val_loader, model, criterion, start_epoch, use_cuda, local_rank)
+        test_loss, test_acc = test(val_loader, model, criterion, start_epoch, args.local_rank, nprocs)
         print(' Test Loss:  %.8f, Test Acc:  %.2f' % (test_loss, test_acc))
         return
     # TensorBoardX Logs
@@ -259,8 +256,8 @@ def main():
 
         print('\nEpoch: [%d | %d]' % (epoch + 1, args.epochs))
 
-        train_loss, train_acc = train(train_loader, model, criterion, optimizer, epoch, use_cuda, local_rank)
-        test_loss, test_acc = test(val_loader, model, criterion, epoch, use_cuda, local_rank)
+        train_loss, train_acc = train(train_loader, model, criterion, optimizer, epoch, args.local_rank, nprocs)
+        test_loss, test_acc = test(val_loader, model, criterion, epoch, args.local_rank, nprocs)
 
         #add scalars
         train_writer.add_scalar('train_epoch_loss', train_loss, epoch)
@@ -287,7 +284,7 @@ def main():
     print('Best acc:')
     print(best_acc)
 
-def train(train_loader, model, criterion, optimizer, epoch, use_cuda, local_rank):
+def train(train_loader, model, criterion, optimizer, epoch, local_rank, nprocs):
     # switch to train mode
     model.train()
     torch.set_grad_enabled(True)
@@ -302,15 +299,11 @@ def train(train_loader, model, criterion, optimizer, epoch, use_cuda, local_rank
     bar = Bar('Processing', max=len(train_loader))
     show_step = len(train_loader) // 10
     for batch_idx, (inputs, targets) in enumerate(train_loader):
-        
-        batch_size = inputs.size(0)
-        if batch_size < args.train_batch:
-            continue
         # measure data loading time
         data_time.update(time.time() - end)
 
-        if use_cuda:
-            inputs, targets = inputs.cuda(local_rank, non_blocking=True), targets.cuda(local_rank, non_blocking=True)
+        
+        inputs, targets = inputs.cuda(local_rank, non_blocking=True), targets.cuda(local_rank, non_blocking=True)
         inputs, targets = torch.autograd.Variable(inputs), torch.autograd.Variable(targets)
 
         # compute output
@@ -340,11 +333,6 @@ def train(train_loader, model, criterion, optimizer, epoch, use_cuda, local_rank
         batch_time.update(time.time() - end)
         end = time.time()
 
-        # add scalars
-        train_writer.add_scalar('train_batch_loss', loss.avg, num_itertions)
-        train_writer.add_scalar('train_batch_acc', top1.avg, num_itertions)
-        num_itertions += 1
-
         # plot progress
         bar.suffix  = '({batch}/{size}) Data: {data:.3f}s | Batch: {bt:.3f}s | Loss: {loss:.4f} | top1: {top1: .4f} | top5: {top5: .4f}'.format(
                     batch=batch_idx + 1,
@@ -362,8 +350,7 @@ def train(train_loader, model, criterion, optimizer, epoch, use_cuda, local_rank
     
     return (losses.avg, top1.avg)
 
-def test(val_loader, model, criterion, epoch, use_cuda, local_rank):
-    global best_acc
+def test(val_loader, model, criterion, epoch, local_rank, nprocs):
 
     batch_time = AverageMeter()
     data_time = AverageMeter()
@@ -381,8 +368,8 @@ def test(val_loader, model, criterion, epoch, use_cuda, local_rank):
         # measure data loading time
         data_time.update(time.time() - end)
 
-        if use_cuda:
-            inputs, targets = inputs.cuda(local_rank, non_blocking=True), targets.cuda(local_rank, non_blocking=True)
+        
+        inputs, targets = inputs.cuda(local_rank, non_blocking=True), targets.cuda(local_rank, non_blocking=True)
         inputs, targets = torch.autograd.Variable(inputs, volatile=True), torch.autograd.Variable(targets)
 
         # compute output

@@ -91,9 +91,6 @@ parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
 parser.add_argument('--local_rank', default=-1, type=int, 
                     help='node rank for distributed training')
 
-args = parser.parse_args()
-
-
 class data_prefetcher():
     def __init__(self, loader):
         self.loader = iter(loader)
@@ -148,35 +145,31 @@ class data_prefetcher():
         self.preload()
         return input, target
 
-# Use CUDA
-use_cuda = torch.cuda.is_available()
-nprocs = torch.cuda.device_count()
-
 def reduce_mean(tensor, nprocs):
     rt = tensor.clone()
     dist.all_reduce(rt, op=dist.ReduceOp.SUM)
     rt /= nprocs
     return rt
 
-# Random seed
-if args.manualSeed is None:
-    args.manualSeed = random.randint(1, 10000)
-random.seed(args.manualSeed)
-torch.manual_seed(args.manualSeed)
-if use_cuda:
+def main():
+    args = parser.parse_args()
+    nprocs = torch.cuda.device_count()
+    # Random seed
+    if args.manualSeed is None:
+        args.manualSeed = random.randint(1, 10000)
+    random.seed(args.manualSeed)
+    torch.manual_seed(args.manualSeed)
     torch.cuda.manual_seed_all(args.manualSeed)
     cudnn.deterministic = True
+    main_worker(args.local_rank, nprocs, args)
 
-best_acc = 0  # best test accuracy
-num_itertions = 0 #total iterations
-
-def main():
+def main_worker(local_rank, nprocs, args):
+    best_acc = 0
     dist.init_process_group(backend='nccl')
     
     train_batch = int(args.train_batch / nprocs)
     test_batch = int(args.test_batch / nprocs)
     
-    global best_acc
     start_epoch = args.start_epoch  # start from epoch 0 or last checkpoint epoch
 
     if not os.path.isdir(args.checkpoint):
@@ -201,7 +194,6 @@ def main():
                                                batch_size=train_batch,
                                                num_workers=args.workers,
                                                pin_memory=True,
-                                               shuffle=True,
                                                sampler=train_sampler)
 
     val_dataset = datasets.ImageFolder(valdir, transforms.Compose([
@@ -233,7 +225,7 @@ def main():
     criterion = nn.CrossEntropyLoss().cuda()
     optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay, nesterov=True)
 
-    model, optimizer = amp.initialize(model, optimizer)
+    model, optimizer = amp.initialize(model, optimizer, opt_level="O1")
     model = DistributedDataParallel(model)
     cudnn.benchmark = True
 
@@ -299,7 +291,7 @@ def main():
 
     if args.evaluate:
         print('\nEvaluation only')
-        test_loss, test_acc = test(val_loader, model, criterion, start_epoch, use_cuda, local_rank)
+        test_loss, test_acc = test(val_loader, model, criterion, start_epoch, args.local_rank, nprocs)
         print(' Test Loss:  %.8f, Test Acc:  %.2f' % (test_loss, test_acc))
         return
     # TensorBoardX Logs
@@ -313,8 +305,8 @@ def main():
 
         print('\nEpoch: [%d | %d]' % (epoch + 1, args.epochs))
 
-        train_loss, train_acc = train(train_loader, model, criterion, optimizer, epoch, use_cuda, local_rank)
-        test_loss, test_acc = test(val_loader, model, criterion, epoch, use_cuda, local_rank)
+        train_loss, train_acc = train(train_loader, model, criterion, optimizer, epoch, local_rank, nprocs)
+        test_loss, test_acc = test(val_loader, model, criterion, epoch, local_rank, nprocs)
 
         #add scalars
         train_writer.add_scalar('train_epoch_loss', train_loss, epoch)
@@ -341,7 +333,7 @@ def main():
     print('Best acc:')
     print(best_acc)
 
-def train(train_loader, model, criterion, optimizer, epoch, use_cuda, local_rank):
+def train(train_loader, model, criterion, optimizer, epoch, local_rank, nprocs):
     # switch to train mode
     model.train()
     torch.set_grad_enabled(True)
@@ -359,10 +351,6 @@ def train(train_loader, model, criterion, optimizer, epoch, use_cuda, local_rank
     inputs, targets = prefetcher.next()
     batch_idx = 0
     while inputs is not None:
-        
-        batch_size = inputs.size(0)
-        if batch_size < args.train_batch:
-            continue
         # measure data loading time
         data_time.update(time.time() - end)
 
@@ -394,11 +382,6 @@ def train(train_loader, model, criterion, optimizer, epoch, use_cuda, local_rank
         batch_time.update(time.time() - end)
         end = time.time()
 
-        # add scalars
-        train_writer.add_scalar('train_batch_loss', loss.avg, num_itertions)
-        train_writer.add_scalar('train_batch_acc', top1.avg, num_itertions)
-        num_itertions += 1
-
         # plot progress
         bar.suffix  = '({batch}/{size}) Data: {data:.3f}s | Batch: {bt:.3f}s | Loss: {loss:.4f} | top1: {top1: .4f} | top5: {top5: .4f}'.format(
                     batch=batch_idx + 1,
@@ -418,8 +401,7 @@ def train(train_loader, model, criterion, optimizer, epoch, use_cuda, local_rank
     
     return (losses.avg, top1.avg)
 
-def test(val_loader, model, criterion, epoch, use_cuda, local_rank):
-    global best_acc
+def test(val_loader, model, criterion, epoch, local_rank, nprocs):
 
     batch_time = AverageMeter()
     data_time = AverageMeter()
