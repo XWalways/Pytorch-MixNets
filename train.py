@@ -51,6 +51,8 @@ parser.add_argument('-j', '--workers', default=32, type=int, metavar='N',
 # Optimization options
 parser.add_argument('--epochs', default=90, type=int, metavar='N',
                     help='number of total epochs to run')
+parser.add_argument('--warmup-epochs', type=int, default=3, metavar='N',
+                    help='epochs to warmup LR, if scheduler supports')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
 parser.add_argument('--train-batch', default=128, type=int, metavar='N',
@@ -69,6 +71,8 @@ parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
                     help='momentum')
 parser.add_argument('--weight-decay', '--wd', default=1e-4, type=float,
                     metavar='W', help='weight decay (default: 1e-4)')
+parser.add_argument('--clip-grad', type=float, default=None, metavar='NORM',
+                    help='Clip gradient norm (default: None, no clipping)')
 # Checkpoints
 parser.add_argument('-c', '--checkpoint', default='checkpoint', type=str, metavar='PATH',
                     help='path to save checkpoint (default: checkpoint)')
@@ -117,7 +121,7 @@ def main_worker(local_rank, nprocs, args):
     best_acc = 0  # best test accuracy
 
     dist.init_process_group(backend='nccl')
-    torch.cuda.set_device(args.local_rank)
+    torch.cuda.set_device(local_rank)
 
     train_batch = int(args.train_batch / nprocs)
     test_batch = int(args.test_batch / nprocs)
@@ -173,11 +177,11 @@ def main_worker(local_rank, nprocs, args):
     print('Flops:  %.3fG' % (flops / 1e9))
     print('Params: %.2fM' % (params / 1e6))
 
-    model.cuda(args.local_rank)
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank], find_unused_parameters=True)
+    model.cuda(local_rank)
+    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], find_unused_parameters=True)
 
     # define loss function (criterion) and optimizer
-    criterion = nn.CrossEntropyLoss().cuda(args.local_rank)
+    criterion = nn.CrossEntropyLoss().cuda(local_rank)
     optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay, nesterov=True)
     cudnn.benchmark = True
 
@@ -243,9 +247,9 @@ def main_worker(local_rank, nprocs, args):
 
     if args.evaluate:
         print('\nEvaluation only')
-        test_loss, test_acc = test(val_loader, model, criterion, start_epoch, args.local_rank, nprocs)
+        test_loss, test_acc = test(val_loader, model, criterion, start_epoch, local_rank, nprocs, args)
         print(' Test Loss:  %.8f, Test Acc:  %.2f' % (test_loss, test_acc))
-        return
+        
     # TensorBoardX Logs
     train_writer = tensorboardX.SummaryWriter(args.logdir)
     # Train and val
@@ -254,10 +258,15 @@ def main_worker(local_rank, nprocs, args):
         val_sampler.set_epoch(epoch)
         lr_scheduler.step()
 
-        print('\nEpoch: [%d | %d]' % (epoch + 1, args.epochs))
+        if epoch < args.warmup_epochs:
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = args.lr * ((epoch + 1) / args.warmup_epochs)
 
-        train_loss, train_acc = train(train_loader, model, criterion, optimizer, epoch, args.local_rank, nprocs)
-        test_loss, test_acc = test(val_loader, model, criterion, epoch, args.local_rank, nprocs)
+
+        print('\nEpoch: [%d | %d] Learning Rate : %f' % (epoch + 1, args.epochs, optimizer.param_groups[0]['lr']))
+
+        train_loss, train_acc = train(train_loader, model, criterion, optimizer, epoch, local_rank, nprocs, args)
+        test_loss, test_acc = test(val_loader, model, criterion, epoch, local_rank, nprocs, args)
 
         #add scalars
         train_writer.add_scalar('train_epoch_loss', train_loss, epoch)
@@ -284,7 +293,7 @@ def main_worker(local_rank, nprocs, args):
     print('Best acc:')
     print(best_acc)
 
-def train(train_loader, model, criterion, optimizer, epoch, local_rank, nprocs):
+def train(train_loader, model, criterion, optimizer, epoch, local_rank, nprocs, args):
     # switch to train mode
     model.train()
     torch.set_grad_enabled(True)
@@ -326,6 +335,8 @@ def train(train_loader, model, criterion, optimizer, epoch, local_rank, nprocs):
         # compute gradient and do SGD step
         optimizer.zero_grad()
         loss.backward()
+        if args.clip_grad is not None:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
         optimizer.step()
         
 
@@ -334,23 +345,24 @@ def train(train_loader, model, criterion, optimizer, epoch, local_rank, nprocs):
         end = time.time()
 
         # plot progress
-        bar.suffix  = '({batch}/{size}) Data: {data:.3f}s | Batch: {bt:.3f}s | Loss: {loss:.4f} | top1: {top1: .4f} | top5: {top5: .4f}'.format(
-                    batch=batch_idx + 1,
-                    size=len(train_loader),
-                    data=data_time.val,
-                    bt=batch_time.val,
-                    loss=losses.avg,
-                    top1=top1.avg,
-                    top5=top5.avg,
-                    )
-        if (batch_idx) % show_step == 0:
-            print(bar.suffix)
-        bar.next()
+        if local_rank == 0:
+            bar.suffix  = '({batch}/{size}) Data: {data:.3f}s | Batch: {bt:.3f}s | Loss: {loss:.4f} | top1: {top1: .4f} | top5: {top5: .4f}'.format(
+                        batch=batch_idx + 1,
+                        size=len(train_loader),
+                        data=data_time.val,
+                        bt=batch_time.val,
+                        loss=losses.avg,
+                        top1=top1.avg,
+                        top5=top5.avg,
+                        )
+            if (batch_idx+1) % show_step == 0:
+                print(bar.suffix)
+            bar.next()
     bar.finish()
     
     return (losses.avg, top1.avg)
 
-def test(val_loader, model, criterion, epoch, local_rank, nprocs):
+def test(val_loader, model, criterion, epoch, local_rank, nprocs, args):
 
     batch_time = AverageMeter()
     data_time = AverageMeter()
@@ -370,7 +382,7 @@ def test(val_loader, model, criterion, epoch, local_rank, nprocs):
 
         
         inputs, targets = inputs.cuda(local_rank, non_blocking=True), targets.cuda(local_rank, non_blocking=True)
-        inputs, targets = torch.autograd.Variable(inputs, volatile=True), torch.autograd.Variable(targets)
+        inputs, targets = torch.autograd.Variable(inputs, volatile=True), torch.autograd.Variable(targets, volatile=True)
 
         # compute output
         outputs = model(inputs)
@@ -394,15 +406,16 @@ def test(val_loader, model, criterion, epoch, local_rank, nprocs):
         end = time.time()
 
         # plot progress
-        bar.suffix  = '({batch}/{size}) Data: {data:.3f}s | Batch: {bt:.3f}s | top1: {top1: .4f} | top5: {top5: .4f}'.format(
-                    batch=batch_idx + 1,
-                    size=len(val_loader),
-                    data=data_time.avg,
-                    bt=batch_time.avg,
-                    top1=top1.avg,
-                    top5=top5.avg,
-                    )
-        bar.next()
+        if local_rank == 0:
+            bar.suffix  = '({batch}/{size}) Data: {data:.3f}s | Batch: {bt:.3f}s | top1: {top1: .4f} | top5: {top5: .4f}'.format(
+                        batch=batch_idx + 1,
+                        size=len(val_loader),
+                        data=data_time.avg,
+                        bt=batch_time.avg,
+                        top1=top1.avg,
+                        top5=top5.avg,
+                        )
+            bar.next()
     print(bar.suffix)
     bar.finish()
     return (losses.avg, top1.avg)
